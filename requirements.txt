@@ -1,0 +1,3 @@
+openai
+redis
+pip install python-dotenv
