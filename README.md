@@ -19,6 +19,7 @@
 | 🔒 **生产级安全设计** | 使用 `secrets` 密码级随机源生成短码；`SETNX` 原子命令写入，杜绝高并发覆盖风险 |
 | 🔍 **安全模糊查询** | 使用 Redis `SCAN` 游标迭代替代危险的 `KEYS *`，即使在百万级数据下也能安全遍历 |
 | 🗣️ **多轮上下文对话** | 支持跨轮次的指代理解，用户说“查一下刚才那个”，Agent 能准确解析并响应 |
+| 🧪 **可测试架构** | 存储与 LLM 客户端均可注入：pytest + fakeredis + mock 模型响应，全链路测试无需真实 API 与 Redis |
 
 ---
 
@@ -32,6 +33,7 @@
 | 随机生成 | Python `secrets` + `string` |
 | 环境管理 | `python-dotenv` |
 | 编程语言 | Python 3.10+ |
+| 测试 | pytest + fakeredis（mock LLM，不产生真实 API 调用） |
 
 ---
 
@@ -145,8 +147,14 @@ python agent_demo.py
 
 ```
 shortlink-agent/
-├── agent_demo.py          # 主程序（Agent 核心逻辑）
-├── requirements.txt       # Python 依赖清单
+├── agent_demo.py          # CLI 入口：装配真实依赖并启动多轮对话
+├── agent.py               # Agent 决策层：Function Calling 循环 + 滑动窗口
+├── tools.py               # 工具层：Tool Schema + Redis 短链接业务
+├── tests/                 # pytest 测试（fakeredis + mock LLM）
+├── requirements.txt       # 运行时依赖清单
+├── requirements-dev.txt   # 测试依赖清单
+├── pytest.ini             # pytest 配置
+├── .github/workflows/ci.yml  # GitHub Actions 自动测试
 ├── .env.example           # 环境变量模板
 ├── .gitignore             # Git 忽略规则
 └── README.md              # 项目文档
@@ -226,13 +234,28 @@ short_code = ''.join(secrets.choice(alphabet) for _ in range(6))  # 6位，空�
 为避免长对话超出模型 Token 上限，代码实现了滑动窗口机制：
 
 ```python
-MAX_HISTORY_TURNS = 10
-max_messages = MAX_HISTORY_TURNS * 2
-if len(conversation_history) > max_messages:
-    conversation_history = conversation_history[-max_messages:]
+# agent.py：按“轮”裁剪，每轮 = 1 条 user + 1 条 assistant
+history = trim_history(history)   # 默认保留最近 10 轮（20 条消息）
 ```
 
-保留最近 10 轮对话（每轮 = 1 条用户消息 + 1 条助手回复），既能维持上下文的连续性，又能有效控制 API 调用成本。
+保留最近 10 轮对话，既能维持上下文的连续性，又能有效控制 API 调用成本。
+
+---
+
+## 🧪 运行测试
+
+项目内置自动化测试，无需真实 Redis 与 DeepSeek API：
+
+- `tests/test_tools.py`：短链接生成、SETNX 原子写入、冲突重试、SCAN 模糊查询建议
+- `tests/test_agent.py`：mock 模型返回的 `tool_calls`，验证“决策 → 工具执行 → 回复”链路与消息配对
+- `tests/test_memory.py`：滑动窗口对长对话的裁剪行为
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+CI（`.github/workflows/ci.yml`）会在 push / PR 时于 Python 3.10 / 3.12 / 3.14 上自动运行上述测试。
 
 ---
 
