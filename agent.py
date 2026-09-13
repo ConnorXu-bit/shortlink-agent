@@ -5,12 +5,14 @@ API 调用；本模块不感知 DeepSeek / OpenAI 之外的任何存储细节。
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional
 
 ExecuteTool = Callable[[str, dict], str]
 
 DEFAULT_MAX_TURNS = 10
 DEFAULT_MAX_TOOL_ROUNDS = 5
+DEFAULT_MAX_PARALLEL_TOOLS = 4
 
 
 def trim_history(messages: List[dict], max_turns: int = DEFAULT_MAX_TURNS) -> List[dict]:
@@ -100,19 +102,25 @@ class Agent:
         }
 
     def _run_tool_calls(self, tool_calls: list) -> List[dict]:
-        """执行一批工具调用，返回与之一一配对的 role="tool" 消息。"""
-        results = []
-        for tool_call in tool_calls:
-            try:
-                arguments = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                arguments = {}
-            result = self.execute_tool(tool_call.function.name, arguments)
-            results.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                }
-            )
-        return results
+        """执行一批工具调用，返回与之一一配对的 role="tool" 消息。
+
+        同一轮里的多个工具调用彼此独立（协议上互不依赖），而且都是 I/O 密集
+        （Redis 往返），因此并发执行；用 map 保证回填顺序与 tool_calls 一致。
+        """
+        if not tool_calls:
+            return []
+        workers = min(len(tool_calls), DEFAULT_MAX_PARALLEL_TOOLS)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(self._run_one_tool, tool_calls))
+
+    def _run_one_tool(self, tool_call) -> dict:
+        try:
+            arguments = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+        result = self.execute_tool(tool_call.function.name, arguments)
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": result,
+        }

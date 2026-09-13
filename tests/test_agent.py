@@ -1,5 +1,7 @@
 """Agent 决策链路测试：mock LLM，验证决策-执行-观察循环与消息配对。"""
 
+import time
+
 import fakeredis
 
 from agent import Agent
@@ -169,9 +171,11 @@ def test_loop_continues_across_multiple_tool_rounds():
     assert len(calls) == 3
     # 每一轮都要带 tools，模型才有机会决定是否继续调用
     assert all("tools" in c for c in calls)
-    # 第三次调用时，前两轮的工具结果都已回填进上下文
-    tool_messages = [m for m in calls[2]["messages"] if m["role"] == "tool"]
-    assert {m["tool_call_id"] for m in tool_messages} == {"call_1", "call_2"}
+    # 上下文是逐轮累积的：第 2 次调用只看到第 1 轮结果，第 3 次才看到两轮
+    second_round_tools = [m for m in calls[1]["messages"] if m["role"] == "tool"]
+    assert {m["tool_call_id"] for m in second_round_tools} == {"call_1"}
+    third_round_tools = [m for m in calls[2]["messages"] if m["role"] == "tool"]
+    assert {m["tool_call_id"] for m in third_round_tools} == {"call_1", "call_2"}
     # 第一轮的工具副作用真实落库
     assert len(toolbox.redis.keys("*")) == 1
 
@@ -201,3 +205,32 @@ def test_loop_stops_at_max_rounds_and_forces_final_answer():
     assert len(calls) == 3              # 2 轮执行 + 1 次强制收尾
     assert "tools" in calls[0] and "tools" in calls[1]
     assert "tools" not in calls[2]      # 收尾调用不再给模型工具，逼它用自然语言回答
+
+
+def test_tool_calls_in_one_round_run_concurrently():
+    """同一轮的多个工具调用互相独立，应当并发执行而不是排队。"""
+    first = make_response(
+        make_message(
+            tool_calls=[
+                make_tool_call("create_short_link", {"url": f"{URL}/{i}"}, call_id=f"call_{i}")
+                for i in range(3)
+            ]
+        )
+    )
+    second = make_response(make_message(content="三个都好了。"))
+    client = FakeClient([first, second])
+
+    def slow_execute(name, arguments):
+        time.sleep(0.3)          # 模拟一次 Redis 网络往返
+        return "ok"
+
+    agent = Agent(client=client, tools=TOOLS, execute_tool=slow_execute)
+
+    started = time.perf_counter()
+    agent.chat([{"role": "user", "content": "缩短这三个链接"}])
+    elapsed = time.perf_counter() - started
+
+    # 串行需要约 0.9 秒，并发约 0.3 秒；留足余量避免 CI 上偶发波动
+    assert elapsed < 0.6
+    tool_messages = [m for m in client.completions.calls[1]["messages"] if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in tool_messages] == ["call_0", "call_1", "call_2"]

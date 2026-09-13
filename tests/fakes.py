@@ -1,6 +1,7 @@
 """可编排响应的 OpenAI 客户端替身：无真实 API 也能测试 Agent 决策链路。"""
 
 import json
+import copy
 from types import SimpleNamespace
 
 
@@ -29,7 +30,12 @@ class FakeCompletions:
         self.calls = []
 
     def create(self, **kwargs):
-        self.calls.append(kwargs)
+        # 必须快照：Agent 会持续往同一个 messages 列表追加，
+        # 直接存引用的话，每条记录看到的都是"最终状态"而不是"当时的模样"。
+        record = dict(kwargs)
+        if "messages" in record:
+            record["messages"] = copy.deepcopy(record["messages"])
+        self.calls.append(record)
         if not self.responses:
             raise AssertionError("模型响应序列已耗尽，请为每次 create 配置响应")
         return self.responses.pop(0)
