@@ -13,7 +13,7 @@
 
 | 特性 | 说明 |
 |------|------|
-| 🧠 **ReAct 自主决策** | 基于推理-行动-观察循环，Agent 自动识别用户意图（缩短/查询），动态选择并调用对应工具 |
+| 🧠 **ReAct 自主决策** | 真正的「推理-行动-观察」循环：模型决定调哪个工具 → 程序执行 → 结果回填 → 模型再决定下一步，直到它主动给出最终回复；带 5 轮上限防止调用链不收敛 |
 | 🔧 **标准化工具封装** | 业务逻辑严格遵循 OpenAI Function Calling 规范封装为 Tool，实现决策层与执行层解耦 |
 | 💾 **持久化记忆系统** | Redis 存储短链数据，服务重启不丢失；对话历史采用滑动窗口机制，兼顾记忆长度与 Token 成本 |
 | 🔒 **生产级安全设计** | 使用 `secrets` 密码级随机源生成短码；`SETNX` 原子命令写入，杜绝高并发覆盖风险 |
@@ -50,7 +50,9 @@
 │  │  1. 意图识别：用户输入 → 模型推理                     │   │
 │  │  2. 工具选择：判断是否需要调用工具 & 选择具体工具      │   │
 │  │  3. 参数提取：从自然语言中提取结构化参数               │   │
-│  │  4. 结果合成：将工具执行结果转化为自然语言回复         │   │
+│  │  4. 观察回填：工具结果以 role="tool" 回填进上下文      │   │
+│  │  5. 结果合成：模型不再请求工具时输出自然语言回复       │   │
+│  │     ↺ 2→4 循环，直到模型不再请求工具（最多 5 轮）      │   │
 │  └─────────────────────────────────────────────────────┘   │
 └─────────────────────────┬───────────────────────────────────┘
                           ▼
@@ -242,12 +244,38 @@ history = trim_history(history)   # 默认保留最近 10 轮（20 条消息）
 
 ---
 
+### 5. 为什么工具调用要写成循环？
+
+模型一次决策之后**可能还需要再调一次工具**：比如先 `create_short_link` 得到短码，再
+`get_original_url` 验证，最后才总结。如果只调一次模型就收尾，链路到这里就断了。
+
+所以 `Agent.chat()` 写成循环：只要模型返回 `tool_calls`，就执行并把结果回填，然后
+**带着工具结果再次调用模型**（依然带 `tools`），直到模型不再请求工具。
+
+```python
+for _ in range(self.max_tool_rounds):
+    message = self._create(work, with_tools=True)
+    if not getattr(message, "tool_calls", None):
+        return message.content or ""        # 模型决定收尾
+    work.append(self._assistant_message(message))
+    work.extend(self._run_tool_calls(message.tool_calls))
+
+# 不收敛兜底：摘掉 tools 强制模型用自然语言回答
+return self._create(work, with_tools=False).content or ""
+```
+
+**为什么要设轮数上限**：模型理论上可以无限请求工具，既烧钱又可能死循环。达到
+`max_tool_rounds`（默认 5）后，最后一次调用**不再传 `tools`**，模型无法再请求工具，
+只能给出自然语言收尾——这比直接抛异常或返回空字符串对用户友好得多。
+
+---
+
 ## 🧪 运行测试
 
 项目内置自动化测试，无需真实 Redis 与 DeepSeek API：
 
 - `tests/test_tools.py`：短链接生成、SETNX 原子写入、冲突重试、SCAN 模糊查询建议
-- `tests/test_agent.py`：mock 模型返回的 `tool_calls`，验证“决策 → 工具执行 → 回复”链路与消息配对
+- `tests/test_agent.py`：mock 模型返回的 `tool_calls`，验证多轮「决策 → 执行 → 观察」循环、消息配对、轮数上限与强制收尾
 - `tests/test_memory.py`：滑动窗口对长对话的裁剪行为
 
 ```bash

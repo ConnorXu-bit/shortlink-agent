@@ -1,4 +1,4 @@
-"""Agent 决策链路测试：mock LLM，验证决策-执行-回复与消息配对。"""
+"""Agent 决策链路测试：mock LLM，验证决策-执行-观察循环与消息配对。"""
 
 import fakeredis
 
@@ -14,12 +14,13 @@ from fakes import (
 URL = "https://example.com/very/long/path"
 
 
-def make_agent(client):
+def make_agent(client, **kwargs):
     toolbox = ShortLinkToolbox(fakeredis.FakeRedis(decode_responses=True))
     agent = Agent(
         client=client,
         tools=TOOLS,
         execute_tool=make_tool_dispatcher(toolbox),
+        **kwargs,
     )
     return agent, toolbox
 
@@ -141,3 +142,62 @@ def test_unknown_tool_result_flows_back_to_model():
         m for m in client.completions.calls[1]["messages"] if m["role"] == "tool"
     ]
     assert tool_messages[0]["content"] == "未知工具：mystery_tool"
+
+
+def test_loop_continues_across_multiple_tool_rounds():
+    """模型连续两轮请求工具时，要一直循环到它自己给出最终回复。"""
+    first = make_response(
+        make_message(
+            tool_calls=[make_tool_call("create_short_link", {"url": URL}, call_id="call_1")]
+        )
+    )
+    second = make_response(
+        make_message(
+            tool_calls=[
+                make_tool_call("get_original_url", {"short_code": "abc123"}, call_id="call_2")
+            ]
+        )
+    )
+    third = make_response(make_message(content="链路结束，这是最终回复。"))
+    client = FakeClient([first, second, third])
+    agent, toolbox = make_agent(client)
+
+    result = agent.chat([{"role": "user", "content": "先缩短再查回来"}])
+
+    assert result == "链路结束，这是最终回复。"
+    calls = client.completions.calls
+    assert len(calls) == 3
+    # 每一轮都要带 tools，模型才有机会决定是否继续调用
+    assert all("tools" in c for c in calls)
+    # 第三次调用时，前两轮的工具结果都已回填进上下文
+    tool_messages = [m for m in calls[2]["messages"] if m["role"] == "tool"]
+    assert {m["tool_call_id"] for m in tool_messages} == {"call_1", "call_2"}
+    # 第一轮的工具副作用真实落库
+    assert len(toolbox.redis.keys("*")) == 1
+
+
+def test_loop_stops_at_max_rounds_and_forces_final_answer():
+    """模型不收敛时要被轮数上限截停，且最后一次调用不再提供工具。"""
+    first = make_response(
+        make_message(
+            tool_calls=[make_tool_call("create_short_link", {"url": URL}, call_id="call_1")]
+        )
+    )
+    second = make_response(
+        make_message(
+            tool_calls=[
+                make_tool_call("create_short_link", {"url": URL + "/2"}, call_id="call_2")
+            ]
+        )
+    )
+    third = make_response(make_message(content="达到上限后的收尾回复。"))
+    client = FakeClient([first, second, third])
+    agent, _ = make_agent(client, max_tool_rounds=2)
+
+    result = agent.chat([{"role": "user", "content": "不停地缩短"}])
+
+    assert result == "达到上限后的收尾回复。"
+    calls = client.completions.calls
+    assert len(calls) == 3              # 2 轮执行 + 1 次强制收尾
+    assert "tools" in calls[0] and "tools" in calls[1]
+    assert "tools" not in calls[2]      # 收尾调用不再给模型工具，逼它用自然语言回答
